@@ -959,6 +959,10 @@
 								</div>
 
 								<!-- Item Total -->
+								<div v-if="item.tax_amount && item.tax_amount > 0" class="text-xs text-gray-500 mt-0.5">
+									<span class="font-medium">{{ __('Tax') }}</span>
+									<span class="font-semibold text-gray-900 ms-1">{{ formatCurrency(item.tax_amount) }}</span>
+								</div>
 								<div class="text-end flex-shrink-0">
 									<div
 										class="text-xs sm:text-sm font-bold text-blue-600 leading-none"

@@ -1,3 +1,4 @@
+
 import { useInvoice } from "@/composables/useInvoice"
 import { usePOSOffersStore } from "@/stores/posOffers"
 import { usePOSSettingsStore } from "@/stores/posSettings"
@@ -291,7 +292,7 @@ export const usePOSCartStore = defineStore("posCart", () => {
 		deliveryDate.value = date
 	}
 
-	async function submitInvoice() {
+	async function submitInvoice(remarks = null, attachments = null) {
 		if (invoiceItems.value.length === 0) {
 			showWarning(__("Cart is empty"))
 			return
@@ -301,7 +302,7 @@ export const usePOSCartStore = defineStore("posCart", () => {
 			return
 		}
 
-		return await baseSubmitInvoice(targetDoctype.value, deliveryDate.value)
+		return await baseSubmitInvoice(targetDoctype.value, deliveryDate.value, remarks, attachments)
 	}
 
 	async function createSalesOrder() {

@@ -641,6 +641,80 @@
 				<!-- End Right Column -->
 			</div>
 			<!-- End Two Column Layout -->
+
+			<!-- Remarks Section -->
+			<div v-if="allowRemarks" class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+				<h3 class="text-sm font-semibold text-gray-700 mb-2 text-start">{{ __('Remarks') }}</h3>
+				<input v-model="remarks" type="text" placeholder="Type remarks here" class="w-full bg-white p-2 rounded-md border border-gray-300 text-sm" />
+			</div>
+
+			<!-- Attachments Section -->
+			<div v-if="allowAttachments" class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+				<h3 class="text-sm font-semibold text-gray-700 mb-3 text-start flex items-center">
+					<svg class="w-4 h-4 me-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/>
+					</svg>
+					{{ __('Attachments') }}
+					<span v-if="attachments.length > 0" class="ms-2 text-xs font-normal text-gray-500">({{ attachments.length }})</span>
+				</h3>
+
+				<!-- File Input -->
+				<div class="mb-3">
+					<label for="attachment-upload" class="block text-xs font-medium text-gray-600 mb-2">
+						{{ __('Upload Images') }}
+					</label>
+					<input
+						id="attachment-upload"
+						type="file"
+						ref="fileInput"
+						accept="image/*"
+						multiple
+						@change="handleFileSelect"
+						class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+					/>
+				</div>
+
+				<!-- Uploaded Images Preview -->
+				<div v-if="attachments.length > 0" class="grid grid-cols-2 md:grid-cols-3 gap-3">
+					<div
+						v-for="(attachment, index) in attachments"
+						:key="index"
+						class="relative group bg-white border border-gray-200 rounded-lg p-2"
+					>
+						<!-- Image Preview -->
+						<div class="aspect-square bg-gray-100 rounded overflow-hidden mb-2">
+							<img
+								:src="attachment.preview"
+								:alt="attachment.name"
+								class="w-full h-full object-cover"
+							/>
+						</div>
+
+						<!-- File Info -->
+						<div class="text-xs text-gray-600 truncate mb-1">{{ attachment.name }}</div>
+						<div class="text-xs text-gray-500">{{ formatFileSize(attachment.size) }}</div>
+
+						<!-- Remove Button -->
+						<button
+							@click="removeAttachment(index)"
+							class="absolute -top-2 -right-2 w-6 h-6 bg-red-500 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-600"
+						>
+							<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+								<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+							</svg>
+						</button>
+					</div>
+				</div>
+
+				<!-- Empty State -->
+				<div v-else class="text-center py-6 text-gray-500">
+					<svg class="mx-auto h-8 w-8 text-gray-300 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+					</svg>
+					<p class="text-sm">{{ __('No images attached') }}</p>
+					<p class="text-xs text-gray-400 mt-1">{{ __('Click "Choose Files" to add images') }}</p>
+				</div>
+			</div>
 		</template>
 	</Dialog>
 </template>
@@ -687,6 +761,14 @@ const props = defineProps({
 		type: Boolean,
 		default: false,
 	},
+	allowRemarks:{
+		type: Boolean,
+		default: false,
+	},
+	allowAttachments:{
+		type: Boolean,
+		default: false,
+	},
 	customer: {
 		type: [String, Object],
 		default: null,
@@ -715,6 +797,10 @@ const props = defineProps({
 		type: String,
 		default: "Sales Invoice",
 	},
+	invoiceData: {
+		type: Object,
+		default: () => ({}),
+	},
 })
 
 const emit = defineEmits(["update:modelValue", "payment-completed", "update-additional-discount"])
@@ -732,6 +818,11 @@ const paymentEntries = ref([])
 const customerCredit = ref([])
 const customerBalance = ref({ total_outstanding: 0, total_credit: 0, net_balance: 0 })
 const loadingCredit = ref(false)
+const attachments = ref([])
+const fileInput = ref(null)
+
+// Remarks state
+const remarks = ref("")
 
 // Wallet state
 const walletInfo = ref({ wallet_enabled: false, wallet_exists: false, wallet_balance: 0, wallet_name: null })
@@ -1060,6 +1151,68 @@ const selectedSalesPersons = ref([])
 const salesPersonSearch = ref('')
 const loadingSalesPersons = ref(false)
 
+// Attachments methods
+function handleFileSelect(event) {
+	const files = Array.from(event.target.files)
+
+	files.forEach(file => {
+		// Validate file type (images only)
+		if (!file.type.startsWith('image/')) {
+			showWarning(__('Only image files are allowed'))
+			return
+		}
+
+		// Validate file size (max 5MB)
+		const maxSize = 5 * 1024 * 1024 // 5MB
+		if (file.size > maxSize) {
+			showWarning(__('File size must be less than 5MB'))
+			return
+		}
+
+		// Create preview URL
+		const preview = URL.createObjectURL(file)
+
+		// Add to attachments
+		attachments.value.push({
+			file,
+			name: file.name,
+			size: file.size,
+			type: file.type,
+			preview
+		})
+	})
+
+	// Clear file input
+	if (fileInput.value) {
+		fileInput.value.value = ''
+	}
+}
+
+function removeAttachment(index) {
+	const attachment = attachments.value[index]
+	if (attachment.preview) {
+		URL.revokeObjectURL(attachment.preview)
+	}
+	attachments.value.splice(index, 1)
+}
+
+function formatFileSize(bytes) {
+	if (bytes === 0) return '0 Bytes'
+	const k = 1024
+	const sizes = ['Bytes', 'KB', 'MB', 'GB']
+	const i = Math.floor(Math.log(bytes) / Math.log(k))
+	return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+}
+
+function fileToBase64(file) {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader()
+		reader.readAsDataURL(file)
+		reader.onload = () => resolve(reader.result)
+		reader.onerror = error => reject(error)
+	})
+}
+
 const salesPersonsResource = createResource({
 	url: "pos_next.api.pos_profile.get_sales_persons",
 	makeParams() {
@@ -1340,6 +1493,7 @@ watch(show, (newVal) => {
 		customerBalance.value = { total_outstanding: 0, total_credit: 0, net_balance: 0 }
 		selectedSalesPersons.value = []
 		salesPersonSearch.value = ''
+		attachments.value = []
 		// Set default delivery date to today for Sales Orders
 		deliveryDate.value = isSalesOrder.value ? today : ""
 
@@ -1602,7 +1756,7 @@ function clearAll() {
 	customAmount.value = ""
 }
 
-function completePayment() {
+async function completePayment() {
 	log.debug('[PaymentDialog] Complete payment called:', {
 		canComplete: canComplete.value,
 		totalPaid: totalPaid.value,
@@ -1619,6 +1773,20 @@ function completePayment() {
 
 	const isPartial = totalPaid.value < props.grandTotal
 
+	// Convert attachments to base64 for backend processing
+	const processedAttachments = await Promise.all(
+		attachments.value.map(async (att) => {
+			const base64Data = await fileToBase64(att.file)
+			return {
+				name: att.name,
+				size: att.size,
+				type: att.type,
+				file: base64Data
+			}
+		})
+	)
+
+
 	const paymentData = {
 		payments: paymentEntries.value,
 		change_amount: changeAmount.value,
@@ -1626,6 +1794,8 @@ function completePayment() {
 		paid_amount: totalPaid.value,
 		outstanding_amount: isPartial ? remainingAmount.value : 0,
 		sales_team: selectedSalesPersons.value.length > 0 ? selectedSalesPersons.value : null,
+		remarks: remarks.value,
+		attachments: processedAttachments,
 		delivery_date: isSalesOrder.value ? deliveryDate.value : null,
 	}
 

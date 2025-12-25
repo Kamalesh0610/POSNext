@@ -2,11 +2,14 @@ import { createResource } from "frappe-ui"
 import { computed, ref, toRaw } from "vue"
 import { isOffline } from "@/utils/offline"
 import { useSerialNumberStore } from "@/stores/serialNumber"
-
+import { usePOSSettingsStore } from "@/stores/posSettings"
 
 export function useInvoice() {
 	// Serial Number Store for returning serials when items are removed
 	const serialStore = useSerialNumberStore()
+
+	// POS Settings Store for tax inclusive setting
+	const posSettingsStore = usePOSSettingsStore()
 
 	// State
 	const invoiceItems = ref([])
@@ -17,8 +20,6 @@ export function useInvoice() {
 	const posOpeningShift = ref(null) // POS Opening Shift name
 	const additionalDiscount = ref(0)
 	const couponCode = ref(null)
-	const taxRules = ref([]) // Tax rules from POS Profile
-	const taxInclusive = ref(false) // Tax inclusive setting from POS Settings
 
 	// Performance: Incrementally maintained aggregates (updated on add/remove/change)
 	// This avoids O(n) array reductions on every reactive change
@@ -106,6 +107,107 @@ export function useInvoice() {
 		auto: false,
 	})
 
+	const getInvoiceTaxesResource = createResource({
+		url: "pos_next.api.invoices.calculate_taxes_for_invoice",
+		makeParams({ items, pos_profile, tax_inclusive }) {
+			return {
+				items: JSON.stringify(items),
+				pos_profile,
+				tax_inclusive: tax_inclusive !== undefined ? String(Number(Boolean(tax_inclusive))) : undefined,
+			}
+		},
+		auto: false,
+	})
+
+	// Debounced function to fetch server-side tax calculations
+	let taxCalculationTimeout = null
+	function debouncedFetchServerTaxes(delay = 100) {
+		/**
+		 * Debounce server tax calculation to avoid excessive API calls
+		 * while user is actively editing items (typing quantities, etc.)
+		 */
+		if (taxCalculationTimeout) {
+			clearTimeout(taxCalculationTimeout)
+		}
+
+		taxCalculationTimeout = setTimeout(() => {
+			fetchAndApplyServerTaxes()
+		}, delay)
+	}
+
+	async function fetchAndApplyServerTaxes() {
+		/**
+		 * Fetch authoritative tax calculations from server using item tax templates.
+		 * This replaces the old POS Profile-based tax calculation.
+		 */
+		try {
+			// Use toRaw() to ensure we get current, non-reactive values
+			const rawItems = toRaw(invoiceItems.value)
+
+			// Prepare items for server calculation
+			const itemsForTaxCalc = rawItems.map((item) => ({
+				item_code: item.item_code,
+				qty: item.quantity,
+				price_list_rate: item.price_list_rate || item.rate || 0,
+				discount_amount: item.discount_amount || 0,
+				rate: item.rate || 0,
+				idx: rawItems.indexOf(item) + 1, // Add index for tracking
+			}))
+
+			if (itemsForTaxCalc.length === 0) {
+				return // No items to calculate taxes for
+			}
+
+			// Call server-side tax calculation API
+			const result = await getInvoiceTaxesResource.submit({
+				items: itemsForTaxCalc,
+				pos_profile: posProfile.value,
+				tax_inclusive: taxInclusive.value,
+			})
+
+			if (!result || !result.items) {
+				console.warn("Server tax calculation returned no results")
+				return
+			}
+
+			// Update items with server-calculated tax amounts
+			const serverItems = result.items
+
+			// Store old tax amounts for cache adjustment
+			const oldTaxAmounts = {}
+			for (const item of rawItems) {
+				oldTaxAmounts[item.item_code] = item.tax_amount || 0
+			}
+
+			// Update each item with server-calculated values
+			for (const srvItem of serverItems) {
+				// Find corresponding item in our cart
+				const cartItem = rawItems.find(item => item.item_code === srvItem.item_code)
+				if (cartItem) {
+					// Update tax-related fields with server values
+					cartItem.tax_amount = srvItem.tax_amount || 0
+					cartItem.amount = srvItem.amount || 0 // Net amount after discount
+					//cartItem.item_tax_template = srvItem.item_tax_template
+					cartItem.item_tax_rate = srvItem.item_tax_rate
+					cartItem.tax_breakdown = srvItem.tax_breakdown || {}
+				}
+			}
+
+			// Update incremental cache with new tax amounts
+			let totalTaxChange = 0
+			for (const item of rawItems) {
+				const oldTax = oldTaxAmounts[item.item_code] || 0
+				const newTax = item.tax_amount || 0
+				totalTaxChange += newTax - oldTax
+			}
+			_cachedTotalTax.value += totalTaxChange
+
+		} catch (error) {
+			console.error("Error fetching server tax calculations:", error)
+			// Continue with placeholder tax amounts if server calculation fails
+		}
+	}
+
 	// ========================================================================
 	// COMPUTED TOTALS - IMPORTANT: Subtotal uses price_list_rate (original price)
 	// ========================================================================
@@ -150,6 +252,9 @@ export function useInvoice() {
 			invoiceItems.value.length > 0 && remainingAmount.value <= 0.01 // Allow small rounding differences
 		)
 	})
+
+	// Tax inclusive setting from POS Settings store
+	const taxInclusive = computed(() => posSettingsStore.taxInclusive)
 
 	// Actions
 	function addItem(item, quantity = 1) {
@@ -463,38 +568,7 @@ export function useInvoice() {
 		rebuildIncrementalCache()
 	}
 
-	// Performance: Cache tax calculation to avoid repeated loops
-	let cachedTaxRate = 0
-	let taxRulesCacheKey = ""
 
-	function calculateTotalTaxRate() {
-		// Create cache key from tax rules
-		const currentKey = JSON.stringify(taxRules.value)
-
-		// Return cached value if tax rules haven't changed
-		if (currentKey === taxRulesCacheKey && cachedTaxRate !== 0) {
-			return cachedTaxRate
-		}
-
-		// Calculate total tax rate
-		let totalRate = 0
-		if (taxRules.value && taxRules.value.length > 0) {
-			for (const taxRule of taxRules.value) {
-				if (
-					taxRule.charge_type === "On Net Total" ||
-					taxRule.charge_type === "On Previous Row Total"
-				) {
-					totalRate += taxRule.rate || 0
-				}
-			}
-		}
-
-		// Cache the result
-		cachedTaxRate = totalRate
-		taxRulesCacheKey = currentKey
-
-		return totalRate
-	}
 
 	function rebuildIncrementalCache() {
 		/**
@@ -522,25 +596,22 @@ export function useInvoice() {
 	/**
 	 * Recalculates all pricing fields for an invoice item.
 	 *
-	 * This function is the single source of truth for item-level calculations,
-	 * ensuring consistency between UI display and backend invoice data.
+	 * This function prepares item data for server-side tax calculation.
+	 * The authoritative tax calculation now comes from item tax templates (item.taxes)
+	 * instead of POS Profile tax rules.
 	 *
 	 * Calculation Flow:
 	 * 1. Base Amount    = price_list_rate × quantity
 	 * 2. Discount       = Applied based on percentage or fixed amount
-	 * 3. Net Amount     = Base Amount - Discount (may include/exclude tax)
-	 * 4. Tax Amount     = Calculated based on tax_inclusive mode
+	 * 3. Net Amount     = Base Amount - Discount
+	 * 4. Tax Amount     = Calculated server-side using item tax templates
 	 * 5. Final Amount   = Stored in item.amount for backend processing
 	 *
 	 * Important Design Decisions:
 	 * - item.rate always reflects the original list price (price_list_rate)
 	 * - Discounts are stored separately (discount_amount, discount_percentage)
 	 * - This allows UI to display original prices with clear discount visibility
-	 * - Backend receives calculated net rate (amount/quantity) for accurate totals
-	 *
-	 * Tax Modes:
-	 * - Tax Inclusive: Price includes tax. Extract net = gross / (1 + tax_rate)
-	 * - Tax Exclusive: Tax added on top. Tax = net × tax_rate
+	 * - Server-side calculation uses item tax templates from item.taxes
 	 *
 	 * @param {Object} item - Invoice item object with quantity, rates, and discount fields
 	 */
@@ -561,26 +632,21 @@ export function useInvoice() {
 		}
 		item.discount_amount = discountAmount
 
-		// Calculate tax based on inclusive/exclusive mode
-		const totalTaxRate = calculateTotalTaxRate()
-		let netAmount = 0
-		let taxAmount = 0
+		// Calculate basic net amount (before tax)
+		const netAmount = baseAmount - discountAmount
 
-		if (taxInclusive.value && totalTaxRate > 0) {
-			// Tax-inclusive: Work backwards from gross to extract net and tax
-			const grossAmount = baseAmount - discountAmount
-			netAmount = grossAmount / (1 + totalTaxRate / 100)
-			taxAmount = grossAmount - netAmount
-		} else {
-			// Tax-exclusive: Calculate tax on top of net amount
-			netAmount = baseAmount - discountAmount
-			taxAmount = (netAmount * totalTaxRate) / 100
-		}
+		// Update item fields with basic calculations
+		// Tax will be calculated server-side using item tax templates
+		item.rate = priceListRate // Preserve original price for display
+		item.amount = netAmount // Net amount (will be updated by server)
 
-		// Update item fields
-		item.tax_amount = taxAmount
-		item.rate = priceListRate  // Preserve original price for display
-		item.amount = netAmount    // Net amount for backend calculations
+		// Set a placeholder tax amount for immediate UI feedback
+		// This will be replaced by server-side calculation
+		item.tax_amount = item.tax_amount || 0
+
+		// Schedule authoritative server-side tax calculation (debounced)
+		// Server now uses item tax templates from item.taxes instead of POS Profile rules
+		debouncedFetchServerTaxes()
 	}
 
 	function addPayment(payment) {
@@ -663,13 +729,12 @@ export function useInvoice() {
 				item_name: item.item_name,
 				qty: item.quantity,
 				// IMPORTANT: Rate calculation depends on tax mode and discounts
-				// Tax-inclusive mode: Send gross amount (price after discount, before tax extraction)
-				//   - With discount: price_list_rate - discount_amount
-				//   - Without discount: price_list_rate
-				//   ERPNext will extract net amount based on included_in_print_rate flag
+				// Tax-inclusive mode: price_list_rate is already tax-inclusive (gross amount)
+				//   - Apply discount to gross amount, send discounted gross amount
+				//   - Server will extract tax from this discounted gross amount
 				// Tax-exclusive mode: Send net amount (after discount, before tax addition)
 				rate: taxInclusive.value
-					? ((item.price_list_rate || item.rate) - (item.discount_amount || 0) / (item.quantity || 1))
+					? (item.price_list_rate || item.rate) - ((item.discount_amount || 0) / (item.quantity || 1))
 					: (item.quantity > 0 ? item.amount / item.quantity : item.rate),
 				price_list_rate: item.price_list_rate || item.rate,
 				uom: item.uom,
@@ -701,7 +766,7 @@ export function useInvoice() {
 		return result?.data || result
 	}
 
-	async function submitInvoice(targetDoctype = "Sales Invoice", deliveryDate = null) {
+	async function submitInvoice(targetDoctype = "Sales Invoice", deliveryDate = null, remarks = null, attachments = null) {
 		/**
 		 * Two-step submission process:
 		 * 1. Create/update draft invoice
@@ -724,13 +789,12 @@ export function useInvoice() {
 					item_name: item.item_name,
 					qty: item.quantity,
 					// IMPORTANT: Rate calculation depends on tax mode and discounts
-					// Tax-inclusive mode: Send gross amount (price after discount, before tax extraction)
-					//   - With discount: price_list_rate - discount_amount
-					//   - Without discount: price_list_rate
-					//   ERPNext will extract net amount based on included_in_print_rate flag
+					// Tax-inclusive mode: price_list_rate is already tax-inclusive (gross amount)
+					//   - Apply discount to gross amount, send discounted gross amount
+					//   - Server will extract tax from this discounted gross amount
 					// Tax-exclusive mode: Send net amount (after discount, before tax addition)
 					rate: taxInclusive.value
-						? ((item.price_list_rate || item.rate) - (item.discount_amount || 0) / (item.quantity || 1))
+						? (item.price_list_rate || item.rate) - ((item.discount_amount || 0) / (item.quantity || 1))
 						: (item.quantity > 0 ? item.amount / item.quantity : item.rate),
 					price_list_rate: item.price_list_rate || item.rate,
 					uom: item.uom,
@@ -754,6 +818,11 @@ export function useInvoice() {
 
 			if (targetDoctype === "Sales Order" && deliveryDate) {
 				invoiceData.delivery_date = deliveryDate
+			}
+
+			// Add remarks if provided
+			if (remarks) {
+				invoiceData.remarks = remarks
 			}
 
 			// Add sales_team if provided
@@ -786,6 +855,8 @@ export function useInvoice() {
 			const submitData = {
 				change_amount:
 					remainingAmount.value < 0 ? Math.abs(remainingAmount.value) : 0,
+				attachments: attachments,
+				remarks: remarks,
 			}
 
 			try {
@@ -952,7 +1023,7 @@ export function useInvoice() {
 		}
 	}
 
-	async function loadTaxRules(profileName, posSettings = null) {
+async function loadTaxRules(profileName, posSettings = null) {
 		/**
 		 * Load tax rules from POS Profile and tax inclusive setting from POS Settings
 		 */
@@ -1002,7 +1073,6 @@ export function useInvoice() {
 		posOpeningShift,
 		additionalDiscount,
 		couponCode,
-		taxRules,
 		taxInclusive,
 
 		// Computed
@@ -1032,7 +1102,6 @@ export function useInvoice() {
 		resetInvoice,
 		clearCart,
 		setDefaultCustomer,
-		loadTaxRules,
 		setTaxInclusive,
 		recalculateItem,
 		rebuildIncrementalCache,

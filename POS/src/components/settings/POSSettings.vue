@@ -333,6 +333,22 @@
 											<h4 class="text-sm font-semibold text-gray-900">{{ __('Sales Operations') }}</h4>
 										</div>
 										<div class="flex flex-col gap-3">
+											
+											<CheckboxField
+												v-model="settings.allow_remarks"
+												:label="__('Allow Remarks')"
+												:description="__('Enable remarks field in payment dialog')"
+											/>
+											<CheckboxField
+												v-model="settings.allow_attachments"
+												:label="__('Allow Attachments')"
+												:description="__('Enable attachment field in payment dialog')"
+											/>
+											<CheckboxField
+												v-model="settings.allow_credit_sale"
+												:label="__('Allow Credit Sale')"
+												:description="__('Enable sales on credit')"
+											/>
 											<CheckboxField
 												v-model="settings.allow_credit_sale"
 												:label="__('Allow Credit Sale')"

@@ -225,6 +225,65 @@
 						</div>
 					</div>
 				</div>
+				
+				<!-- Attachments Section -->
+				<div class="bg-gray-50 p-4 rounded-lg border border-gray-200">
+					<h4 class="text-sm font-semibold text-gray-700 mb-3 text-start flex items-center">
+						<svg class="w-4 h-4 me-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/>
+						</svg>
+						{{ __('Attachments') }}
+						<span v-if="attachments.length > 0" class="ms-2 text-xs font-normal text-gray-500">({{ attachments.length }})</span>
+					</h4>
+
+					<!-- File Input for Adding New Attachments -->
+					<div class="mb-4">
+						<label for="invoice-attachment-upload" class="block text-xs font-medium text-gray-600 mb-2">
+							{{ __('Add Attachments') }}
+						</label>
+						<input
+							id="invoice-attachment-upload"
+							type="file"
+							ref="fileInput"
+							accept="image/*"
+							multiple
+							@change="handleFileSelect"
+							class="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+						/>
+					</div>
+
+					<!-- Existing Attachments -->
+					<div v-if="attachments.length > 0" class="grid grid-cols-2 md:grid-cols-3 gap-3">
+						<div
+							v-for="(attachment, index) in attachments"
+							:key="index"
+							class="relative group bg-white border border-gray-200 rounded-lg p-2"
+						>
+							<!-- Image Preview -->
+							<div class="aspect-square bg-gray-100 rounded overflow-hidden mb-2">
+								<img
+									:src="attachment.file_url"
+									:alt="attachment.file_name"
+									class="w-full h-full object-cover cursor-pointer"
+									@click="openAttachment(attachment)"
+								/>
+							</div>
+
+							<!-- File Info -->
+							<div class="text-xs text-gray-600 truncate mb-1">{{ attachment.file_name }}</div>
+							<div class="text-xs text-gray-500">{{ formatFileSize(attachment.file_size) }}</div>
+						</div>
+					</div>
+
+					<!-- Empty State -->
+					<div v-else class="text-center py-6 text-gray-500">
+						<svg class="mx-auto h-8 w-8 text-gray-300 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+						</svg>
+						<p class="text-sm">{{ __('No attachments yet') }}</p>
+						<p class="text-xs text-gray-400 mt-1">{{ __('Use the file input above to add images') }}</p>
+					</div>
+				</div>
 
 				<!-- Additional Info -->
 				<div v-if="invoiceData.remarks" class="bg-gray-50 p-4 rounded-lg border border-gray-200">
@@ -263,11 +322,13 @@ import { useFormatters } from "@/composables/useFormatters"
 import { formatCurrency as formatCurrencyUtil } from "@/utils/currency"
 import { getInvoiceStatusColor } from "@/utils/invoice"
 import { logger } from "@/utils/logger"
+import { useToast } from "@/composables/useToast"
 import { Button, Dialog, call } from "frappe-ui"
 import { ref, watch, nextTick, computed } from "vue"
 
 const log = logger.create('InvoiceDetailDialog')
 const { formatDate, formatTime } = useFormatters()
+const { showSuccess, showError, showWarning } = useToast()
 
 const props = defineProps({
 	modelValue: Boolean,
@@ -283,11 +344,28 @@ function formatCurrency(amount) {
 	return formatCurrencyUtil(Number.parseFloat(amount || 0), props.currency)
 }
 
+function formatFileSize(bytes) {
+	if (bytes === 0) return '0 Bytes'
+	const k = 1024
+	const sizes = ['Bytes', 'KB', 'MB', 'GB']
+	const i = Math.floor(Math.log(bytes) / Math.log(k))
+	return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+}
+
+function openAttachment(attachment) {
+	// Open attachment in new window/tab
+	window.open(attachment.file_url, '_blank')
+}
+
 const emit = defineEmits(["update:modelValue", "print-invoice"])
 
 const show = ref(props.modelValue)
 const loading = ref(false)
 const invoiceData = ref(null)
+const attachments = ref([])
+const newAttachments = ref([])
+const fileInput = ref(null)
+const uploadingAttachments = ref(false)
 
 // Computed: Check if this is a credit sale (Pay on Account - no payments, full outstanding)
 const isCreditSale = computed(() => {
@@ -323,6 +401,14 @@ watch(show, async (val) => {
 	if (!val) {
 		// Clear data when closing
 		invoiceData.value = null
+		attachments.value = []
+		newAttachments.value.forEach(att => {
+			if (att.preview) {
+				URL.revokeObjectURL(att.preview)
+			}
+		})
+		newAttachments.value = []
+		uploadingAttachments.value = false
 	} else {
 		// Ensure dialog appears above other dialogs
 		await nextTick()
@@ -353,11 +439,37 @@ async function loadInvoiceDetails() {
 			}))
 		}
 		invoiceData.value = result
+
+		// Load attachments for this invoice
+		await loadAttachments()
 	} catch (error) {
 		log.error("Error loading invoice details:", error)
 		invoiceData.value = null
+		attachments.value = []
 	} finally {
 		loading.value = false
+	}
+}
+
+async function loadAttachments() {
+	if (!props.invoiceName) return
+
+	try {
+		// Get attachments for this invoice
+		const attachmentsResult = await call("frappe.client.get_list", {
+			doctype: "File",
+			filters: {
+				attached_to_doctype: "Sales Invoice",
+				attached_to_name: props.invoiceName,
+			},
+			fields: ["name", "file_name", "file_size", "file_url", "is_private"],
+			limit_page_length: 50,
+		})
+
+		attachments.value = attachmentsResult || []
+	} catch (error) {
+		log.error("Error loading attachments:", error)
+		attachments.value = []
 	}
 }
 
@@ -365,5 +477,100 @@ function handlePrint() {
 	if (!invoiceData.value) return
 	emit("print-invoice", invoiceData.value)
 }
+
+function handleFileSelect(event) {
+	const files = Array.from(event.target.files)
+
+	files.forEach(file => {
+		// Validate file type (images only)
+		if (!file.type.startsWith('image/')) {
+			showWarning(__('Only image files are allowed'))
+			return
+		}
+
+		// Validate file size (max 5MB)
+		const maxSize = 5 * 1024 * 1024 // 5MB
+		if (file.size > maxSize) {
+			showWarning(__('File size must be less than 5MB'))
+			return
+		}
+
+		// Create preview URL
+		const preview = URL.createObjectURL(file)
+
+		// Add to new attachments
+		newAttachments.value.push({
+			file,
+			name: file.name,
+			size: file.size,
+			type: file.type,
+			preview
+		})
+	})
+
+	// Clear file input
+	if (fileInput.value) {
+		fileInput.value.value = ''
+	}
+
+	// Auto-upload if we have new attachments
+	if (newAttachments.value.length > 0) {
+		uploadAttachments()
+	}
+}
+
+async function uploadAttachments() {
+	if (newAttachments.value.length === 0 || !props.invoiceName) return
+
+	uploadingAttachments.value = true
+	try {
+		// Convert attachments to base64
+		const processedAttachments = await Promise.all(
+			newAttachments.value.map(async (att) => {
+				const base64Data = await fileToBase64(att.file)
+				return {
+					name: att.name,
+					size: att.size,
+					type: att.type,
+					file: base64Data
+				}
+			})
+		)
+
+		// Upload to server
+		await call("pos_next.api.invoices.add_invoice_attachments", {
+			invoice_name: props.invoiceName,
+			attachments: processedAttachments
+		})
+
+		// Clear new attachments and reload existing ones
+		newAttachments.value.forEach(att => {
+			if (att.preview) {
+				URL.revokeObjectURL(att.preview)
+			}
+		})
+		newAttachments.value = []
+
+		// Reload attachments
+		await loadAttachments()
+
+		showSuccess(__('Attachments added successfully'))
+	} catch (error) {
+		log.error("Error uploading attachments:", error)
+		showError(__('Failed to add attachments'))
+	} finally {
+		uploadingAttachments.value = false
+	}
+}
+
+function fileToBase64(file) {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader()
+		reader.readAsDataURL(file)
+		reader.onload = () => resolve(reader.result)
+		reader.onerror = error => reject(error)
+	})
+}
+
 </script>
 

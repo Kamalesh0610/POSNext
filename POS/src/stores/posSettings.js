@@ -24,6 +24,8 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		allow_return: 0,
 		allow_write_off_change: 0,
 		allow_partial_payment: 0,
+		allow_remarks: 0,
+		allow_attachments: 0,
 		// Display Settings
 		default_card_view: 0,
 		display_item_code: 0,
@@ -40,6 +42,7 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		allow_print_draft_invoices: 0,
 		// Pricing & Display
 		decimal_precision: "2",
+		tax_inclusive: 0,
 		// Customer Settings
 		allow_customer_purchase_order: 0,
 		allow_duplicate_customer_names: 0,
@@ -111,6 +114,13 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		Boolean(settings.value.allow_partial_payment),
 	)
 
+	const allowRemarks = computed(() =>
+		Boolean(settings.value.allow_remarks),
+	)
+	const allowAttachments = computed(() =>
+		Boolean(settings.value.allow_attachments),
+	)
+
 	// Computed - Display Settings
 	const defaultCardView = computed(() =>
 		Boolean(settings.value.default_card_view),
@@ -154,6 +164,9 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 	// Computed - Pricing & Display
 	const decimalPrecision = computed(
 		() => Number.parseInt(settings.value.decimal_precision) || 2,
+	)
+	const taxInclusive = computed(() =>
+		Boolean(settings.value.tax_inclusive),
 	)
 
 	// Computed - Customer Settings
@@ -291,6 +304,8 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 			allow_return: 0,
 			allow_write_off_change: 0,
 			allow_partial_payment: 0,
+			allow_remarks: 0,
+			allow_attachments: 0,
 			default_card_view: 0,
 			display_item_code: 0,
 			show_customer_balance: 0,
@@ -304,6 +319,7 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 			allow_free_batch_return: 0,
 			allow_print_draft_invoices: 0,
 			decimal_precision: "2",
+			tax_inclusive: 0,
 			allow_customer_purchase_order: 0,
 			allow_duplicate_customer_names: 0,
 			fetch_coupon: 0,
@@ -398,6 +414,8 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 		allowReturn,
 		allowWriteOffChange,
 		allowPartialPayment,
+		allowRemarks,
+		allowAttachments,
 
 		// Computed - Display Settings
 		defaultCardView,
@@ -417,6 +435,7 @@ export const usePOSSettingsStore = defineStore("posSettings", () => {
 
 		// Computed - Pricing & Display
 		decimalPrecision,
+		taxInclusive,
 
 		// Computed - Customer Settings
 		allowCustomerPurchaseOrder,

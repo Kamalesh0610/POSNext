@@ -26,6 +26,8 @@
   "allow_return",
   "allow_write_off_change",
   "allow_partial_payment",
+  "allow_remarks",
+  "allow_attachments",
   "enable_sales_persons",
   "section_break_display",
   "default_card_view",
@@ -223,6 +225,20 @@
    "fieldtype": "Check",
    "label": "Allow Partial Payment",
    "description": "Enable partial payment for invoices"
+  },
+    {
+   "default": "0",
+   "fieldname": "allow_remarks",
+   "fieldtype": "Check",
+   "label": "Allow Remarks",
+   "description": "Enable remarks field in payment dialog"
+  },
+    {
+   "default": "0",
+   "fieldname": "allow_attachments",
+   "fieldtype": "Check",
+   "label": "Allow Attachments",
+   "description": "Enable attachment field in payment dialog"
   },
   {
    "default": "Disabled",

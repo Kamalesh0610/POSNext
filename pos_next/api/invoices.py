@@ -4,6 +4,7 @@
 
 from __future__ import unicode_literals
 import json
+import base64
 import frappe
 from frappe import _
 from frappe.utils import flt, cint, nowdate, nowtime, get_datetime, cstr
@@ -86,6 +87,46 @@ def get_payment_account(mode_of_payment, company):
         ).format(mode_of_payment, company),
         title=_("Missing Account"),
     )
+
+# ==========================================
+# Attachment Functions
+# ==========================================
+
+
+def _process_payment_attachments(invoice_doc, attachments):
+    """Process and attach images to the invoice from payment dialog."""
+    if not attachments:
+        return
+
+    for attachment_data in attachments:
+        try:
+            # Get file data from the attachment
+            file_data = attachment_data.get("file")
+            if not file_data:
+                continue
+
+            # Create file document
+            file_name = attachment_data.get("name", "payment_attachment.jpg")
+            file_content = base64.b64decode(file_data.split(',')[1])  # Remove data:image/jpeg;base64, prefix
+
+            # Save file to File doctype
+            file_doc = frappe.get_doc({
+                "doctype": "File",
+                "file_name": file_name,
+                "attached_to_doctype": "Sales Invoice",
+                "attached_to_name": invoice_doc.name,
+                "content": file_content,
+                "is_private": 0,  # Make attachments public
+            })
+
+            file_doc.flags.ignore_permissions = True
+            file_doc.save()
+
+            frappe.db.commit()
+
+        except Exception as e:
+            frappe.log_error(f"Failed to attach file {attachment_data.get('name')}: {str(e)}", "Payment Attachment Error")
+            # Continue processing other attachments even if one fails
 
 
 # ==========================================
@@ -460,8 +501,10 @@ def update_invoice(data):
         # Populate missing fields (company, currency, accounts, etc.)
         invoice_doc.set_missing_values()
 
-        # Calculate totals and apply discounts (with rounding disabled)
+        # Always calculate taxes and totals - POS pre-calculation is just for UI
+        # The server still needs to calculate taxes for proper invoice creation
         invoice_doc.calculate_taxes_and_totals()
+
         if invoice_doc.grand_total is None:
             invoice_doc.grand_total = 0.0
         if invoice_doc.base_grand_total is None:
@@ -614,6 +657,11 @@ def submit_invoice(invoice=None, data=None):
                     "allocated_percentage": member.get("allocated_percentage", 0),
                 })
 
+        # Handle remarks if provided in data
+        remarks = data.get("remarks")
+        if remarks:
+            invoice_doc.remarks = remarks
+
         # Handle POS Coupon if coupon_code is provided
         coupon_code = invoice.get("coupon_code") or data.get("coupon_code")
         if coupon_code:
@@ -701,6 +749,24 @@ def submit_invoice(invoice=None, data=None):
                     alert=True,
                     indicator="orange"
                 )
+
+ # Process payment attachments if provided
+        attachments = data.get("attachments") or invoice.get("attachments")
+        if attachments:
+            try:
+                _process_payment_attachments(invoice_doc, attachments)
+            except Exception as attach_error:
+                frappe.log_error(
+                    title="Payment Attachment Processing Error",
+                    message=f"Invoice: {invoice_doc.name}, Error: {str(attach_error)}\n{frappe.get_traceback()}"
+                )
+                # Don't fail the entire transaction, just log the error
+                frappe.msgprint(
+                    _("Invoice submitted successfully but attachment processing failed. Please contact administrator."),
+                    alert=True,
+                    indicator="orange"
+                )
+
 
         # Return complete invoice details
         return {
@@ -1201,6 +1267,28 @@ def search_invoices_for_return(
 
 
 @frappe.whitelist()
+def add_invoice_attachments(invoice_name, attachments):
+    """Add attachments to an existing invoice."""
+    try:
+        if not frappe.db.exists("Sales Invoice", invoice_name):
+            frappe.throw(_("Invoice {0} does not exist").format(invoice_name))
+
+        # Check permissions
+        if not frappe.has_permission("Sales Invoice", "write", invoice_name):
+            frappe.throw(_("You don't have permission to modify this invoice"))
+
+        invoice_doc = frappe.get_doc("Sales Invoice", invoice_name)
+
+        # Process attachments
+        _process_payment_attachments(invoice_doc, attachments)
+
+        return {"success": True, "message": _("Attachments added successfully")}
+
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "Add Invoice Attachments Error")
+        raise
+
+@frappe.whitelist()
 def apply_offers(invoice_data, selected_offers=None):
     """Calculate and apply promotional offers using ERPNext Pricing Rules.
 
@@ -1533,3 +1621,210 @@ def apply_offers(invoice_data, selected_offers=None):
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Apply Offers Error")
         frappe.throw(_("Error applying offers: {0}").format(str(e)))
+
+
+# ==========================================
+# Tax Calculation Functions
+# ==========================================
+
+
+@frappe.whitelist()
+def calculate_taxes_for_invoice(items, pos_profile, tax_inclusive=False):
+    """
+    Calculate taxes for invoice items using item tax templates from item.taxes.
+
+    This function replaces the old POS Profile-based tax calculation with item-specific
+    tax templates. Each item uses its own tax template defined in the Item master.
+    """
+    try:
+        # Parse inputs
+        if isinstance(items, str):
+            items = json.loads(items)
+        if isinstance(tax_inclusive, str):
+            tax_inclusive = tax_inclusive.lower() in ('true', '1', 'yes')
+
+        pos_profile_doc = frappe.get_cached_doc("POS Profile", pos_profile)
+        company = pos_profile_doc.company
+
+        # Process each item
+        processed_items = []
+        all_tax_breakdown = []
+
+        for item in items:
+            item_dict = frappe._dict(item) if isinstance(item, dict) else item
+
+            # Get item details including tax template
+            item_doc = frappe.get_cached_doc("Item", item_dict.item_code)
+
+            # Get item tax template from item.taxes (not POS Profile)
+            from erpnext.stock.get_item_details import get_item_tax_template, get_item_tax_map
+
+            # Prepare args for tax template lookup
+            tax_args = {
+                "company": company,
+                "item_code": item_dict.item_code,
+                "doctype": "Sales Invoice",
+            }
+
+            # Get tax template from item.taxes
+            item_tax_template = get_item_tax_template(tax_args, item_doc)
+
+            if item_tax_template:
+                # Get tax rates from the template
+                item_tax_rate_json = get_item_tax_map(company, item_tax_template, as_json=True)
+                item_tax_rates = json.loads(item_tax_rate_json) if item_tax_rate_json else {}
+
+                # Debug logging
+                frappe.logger().info(f"Item {item_dict.item_code}: tax_template={item_tax_template}, tax_rates={item_tax_rates}")
+
+                # Calculate item amounts
+                qty = flt(item_dict.get("qty") or 1)
+                rate = flt(item_dict.get("price_list_rate") or item_dict.get("rate") or 0)
+                discount_amount = flt(item_dict.get("discount_amount") or 0)
+
+                # Base amount before tax (this is the amount after discount)
+                base_amount = (rate * qty) - discount_amount
+                # For tax calculation, we start with the net amount after discount
+                net_amount = base_amount
+
+                # Debug logging for amounts
+                frappe.logger().info(f"Item {item_dict.item_code}: qty={qty}, rate={rate}, discount={discount_amount}, base_amount={base_amount}, net_amount={net_amount}")
+
+                # Calculate tax breakdown
+                tax_amount = 0
+                tax_breakdown = {}
+
+                if tax_inclusive:
+                    # Tax inclusive: Use the exact formula provided by user
+                    # Extract only CGST and SGST rates (case-insensitive matching)
+                    cgst_rate = 0
+                    sgst_rate = 0
+
+                    for account, rate in item_tax_rates.items():
+                        account_name = account.upper()
+                        rate_val = flt(rate)
+
+                        if 'CGST' in account_name and rate_val > 0:
+                            cgst_rate = max(cgst_rate, rate_val)  # Take highest CGST rate
+                        elif 'SGST' in account_name and rate_val > 0:
+                            sgst_rate = max(sgst_rate, rate_val)  # Take highest SGST rate
+
+                    # If no CGST/SGST found, fall back to any positive rates (for backward compatibility)
+                    if cgst_rate == 0 and sgst_rate == 0:
+                        positive_rates = {account: rate for account, rate in item_tax_rates.items() if flt(rate) > 0}
+                        # Use up to 2 highest positive rates (assuming CGST + SGST)
+                        sorted_rates = sorted(positive_rates.items(), key=lambda x: flt(x[1]), reverse=True)
+                        if len(sorted_rates) >= 1:
+                            cgst_rate = flt(sorted_rates[0][1])
+                        if len(sorted_rates) >= 2:
+                            sgst_rate = flt(sorted_rates[1][1])
+
+                    # Calculate total tax rate (CGST + SGST)
+                    total_tax_rate = cgst_rate + sgst_rate
+
+                    # Use exact tax inclusive formula as specified by user
+                    if total_tax_rate > 0:
+                        # Tax-inclusive: Work backwards from gross to extract net and tax
+                        gross_amount = base_amount
+                        net_amount = gross_amount / (1 + total_tax_rate / 100)
+                        tax_amount = gross_amount - net_amount
+
+                        # Distribute tax amount proportionally to CGST and SGST
+                        if cgst_rate > 0:
+                            cgst_amount = tax_amount * (cgst_rate / total_tax_rate)
+                            tax_breakdown[f"CGST"] = cgst_amount
+
+                        if sgst_rate > 0:
+                            sgst_amount = tax_amount * (sgst_rate / total_tax_rate)
+                            tax_breakdown[f"SGST"] = sgst_amount
+
+                        # For UI display, include all original rates in breakdown (but they don't affect tax_amount)
+                        for account, rate in item_tax_rates.items():
+                            if account not in tax_breakdown:
+                                tax_breakdown[account] = (net_amount * flt(rate)) / 100
+                else:
+                    # Tax exclusive: add tax on top of net amount
+                    # CRITICAL FIX: Only use CGST and SGST rates to prevent over-calculation
+                    # Many Item Tax Templates include multiple scenarios (RCM, Input, Refunds, etc.)
+                    # but for POS sales, we only want the basic Output CGST + SGST
+
+                    # Extract only CGST and SGST rates (case-insensitive matching)
+                    cgst_rate = 0
+                    sgst_rate = 0
+
+                    for account, rate in item_tax_rates.items():
+                        account_name = account.upper()
+                        rate_val = flt(rate)
+
+                        if 'CGST' in account_name and rate_val > 0:
+                            cgst_rate = max(cgst_rate, rate_val)  # Take highest CGST rate
+                        elif 'SGST' in account_name and rate_val > 0:
+                            sgst_rate = max(sgst_rate, rate_val)  # Take highest SGST rate
+
+                    # If no CGST/SGST found, fall back to any positive rates (for backward compatibility)
+                    if cgst_rate == 0 and sgst_rate == 0:
+                        positive_rates = {account: rate for account, rate in item_tax_rates.items() if flt(rate) > 0}
+                        # Use up to 2 highest positive rates (assuming CGST + SGST)
+                        sorted_rates = sorted(positive_rates.items(), key=lambda x: flt(x[1]), reverse=True)
+                        if len(sorted_rates) >= 1:
+                            cgst_rate = flt(sorted_rates[0][1])
+                        if len(sorted_rates) >= 2:
+                            sgst_rate = flt(sorted_rates[1][1])
+
+                    # Calculate tax using only CGST + SGST
+                    if cgst_rate > 0:
+                        cgst_amount = (net_amount * cgst_rate) / 100
+                        tax_breakdown[f"CGST"] = cgst_amount
+                        tax_amount += cgst_amount
+
+                    if sgst_rate > 0:
+                        sgst_amount = (net_amount * sgst_rate) / 100
+                        tax_breakdown[f"SGST"] = sgst_amount
+                        tax_amount += sgst_amount
+
+                    # For UI display, include all original rates in breakdown (but they don't affect tax_amount)
+                    for account, rate in item_tax_rates.items():
+                        if account not in tax_breakdown:
+                            tax_breakdown[account] = (net_amount * flt(rate)) / 100
+
+                # Update item with calculated values (only essential ones for ERPNext)
+                item_dict.tax_amount = tax_amount
+                item_dict.amount = net_amount  # Net amount for backend
+
+                # Add to overall tax breakdown for display
+                for account, amount in tax_breakdown.items():
+                    # Find existing entry or create new
+                    existing_entry = None
+                    for entry in all_tax_breakdown:
+                        if entry.get("tax_name") == account or entry.get("account_head") == account:
+                            existing_entry = entry
+                            break
+
+                    if existing_entry:
+                        existing_entry["tax_amount"] += amount
+                    else:
+                        all_tax_breakdown.append({
+                            "tax_name": account,
+                            "account_head": account,
+                            "tax_amount": amount,
+                            "item_wise": {item_dict.get("idx", len(processed_items) + 1): amount}
+                        })
+
+            else:
+                # No tax template - set zero tax
+                item_dict.tax_amount = 0
+                item_dict.amount = (flt(item_dict.get("price_list_rate") or item_dict.get("rate") or 0) * flt(item_dict.get("qty") or 1)) - flt(item_dict.get("discount_amount") or 0)
+                item_dict.item_tax_template = None
+                item_dict.item_tax_rate = "{}"
+                item_dict.tax_breakdown = {}
+
+            processed_items.append(item_dict)
+
+        return {
+            "items": processed_items,
+            "tax_breakdown": all_tax_breakdown
+        }
+
+    except Exception as e:
+        frappe.log_error(frappe.get_traceback(), "Calculate Taxes for Invoice Error")
+        frappe.throw(_("Error calculating taxes for invoice: {0}").format(str(e)))
