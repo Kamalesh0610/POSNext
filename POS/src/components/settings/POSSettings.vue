@@ -350,11 +350,6 @@
 												:description="__('Enable sales on credit')"
 											/>
 											<CheckboxField
-												v-model="settings.allow_credit_sale"
-												:label="__('Allow Credit Sale')"
-												:description="__('Enable sales on credit')"
-											/>
-											<CheckboxField
 												v-model="settings.allow_return"
 												:label="__('Allow Return')"
 												:description="__('Enable product returns')"

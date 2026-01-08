@@ -2447,6 +2447,9 @@ function handleManagementMenuClick(menuItem) {
 	} else if (menuItem === "products") {
 		// Open Stock Lookup dialog in search mode
 		showStockLookup.value = true;
+	} else if (menuItem === "erpnext") {
+		window.open('/app/home', '_blank');
+		return;
 	}
 }
 
